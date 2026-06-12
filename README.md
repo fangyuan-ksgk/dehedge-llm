@@ -9,15 +9,35 @@ models (Qwen series, evaluated on C4), and (2) **fixes** it on TinyStories with 
 
 ## Layout
 ```
-isotropy.py                 # iso_loss (the de-hedging reg that worked best) + log_unigram_bias
+isotropy.py                 # iso_loss (last-layer reg) + white_loss (mid-layer reg) + log_unigram_bias
 dh_gpt.py                   # GPT (baseline) and DeHedgeGPT (bias channel + isotropy hooks)
 data.py                     # TinyStories token stream + C4 marginal / freq-rare helpers
 train_tinystories.py        # compare GPT vs DeHedgeGPT on TinyStories (val / freqCE / rareCE)
 analysis/
   last_layer_laziness.py    # singular-direction analysis of the readout W_u
   mid_layer_laziness.py     # per-dimension AND per-singular-direction causal ablation of a mid layer
+  mid_layer_fix.py          # which reg term cures mid-layer laziness (decorr / equalize / white / iso)
+  mid_layer_fix_strength.py # whitening-strength frontier (quality + alive-fraction + outlier vs coef)
+  mid_layer_recruit.py      # causal proof: whitening recruits the dead mid directions (per-dir ablation)
+  mid_layer_recruit_sweep.py# the conservation law: variance-PR diverges, causal-PR saturates (task-bounded)
+  mid_layer_stack.py        # 2x2: do the last-layer and mid-layer fixes stack? (they're substitutes)
 results/                    # *.json + figures/ produced by the scripts
 ```
+
+## The mid-layer fix (TinyStories)
+The last-layer recipe un-starves the readout; the **mid layers** are lazy too — one outlier feature dimension (a
+self-built constant) and a wide band of singular directions with ~zero causal pain. The fix is `isotropy.white_loss`:
+**scale-free whitening** that drives a mid block's residual covariance toward `C ∝ I` by penalizing only the *shape*
+of the covariance (off-diagonal of the **correlation** matrix + dispersion of the **log-variances**), never its scale.
+```bash
+python analysis/mid_layer_fix_strength.py --coefs 0,0.05,0.2,0.6,1.5,4.0   # the frontier
+python analysis/mid_layer_stack.py        --mid_coef 0.6                   # does it stack with the last-layer fix?
+```
+Findings: driving `C → I` is monotone-good up to coef ≈ 0.6–1.5 (val and rareCE both drop, the outlier dissolves,
+12–17× more directions become active, feature axes converge onto singular directions). But causal usefulness is
+**conserved** — whitening maximizes the *spread* of the causal rank, it cannot *inflate* it past the task's intrinsic
+dimension. And the mid-layer and last-layer fixes are **substitutes**: each alone captures nearly the full gain, because
+hedging lives in the single shared residual stream — fix it anywhere and it propagates everywhere.
 
 ## The fix (TinyStories)
 ```bash
