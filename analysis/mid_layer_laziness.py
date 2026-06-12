@@ -1,16 +1,16 @@
-"""Mid-layer laziness: feature-dimension AND singular-direction causal ablation of a mid-layer representation.
+"""Mid-layer laziness: feature-dimension AND singular-direction causal ablation, for the shared residual AND for
+EVERY sub-module's input representation at a mid layer.
 
-Claims tested (real LLM + C4), on the mid-layer residual representation:
-  * there is an OUTLIER feature dimension with >>100x the magnitude of a typical dimension;
-  * despite aligning with the SMALLEST singular directions of the readout W_u (it lives in the readout's near-null
-    space), ablating it still causally DOMINATES freqCE, rareCE and meanCE;
-  * the AVERAGE feature dimension has negligible causal impact.
-We give the full causal-ablation result for EVERY feature dimension and EVERY singular direction of the mid-layer
-representation: zero each dim (resp. project out each W_u singular direction) at the mid layer, run the rest of the
-model, and record Δ{mean,freq,rare}CE on C4.
+Claims tested (real LLM + C4): each mid-layer representation is lazy — there is an OUTLIER feature dimension with
+>>100x the typical magnitude; the MIDDLE singular directions carry negligible causal pain (model isn't using them);
+only a handful of feature dimensions matter (model isn't using all of them). We give the FULL causal ablation of every
+feature dimension and every singular direction (zero / project-out the representation, run the rest of the model,
+record Δ{mean,freq,rare}CE) for:
+    residual    : the shared mid-layer state, in the readout W_u singular basis  (GLOBAL effect)
+    q/k/v/o/gate/up/down : each sub-module's input, in that sub-module's own weight singular basis (LOCAL effect)
 
-  python mid_layer_laziness.py [--model Qwen/Qwen3-0.6B] [--layer -1=mid] [--n_docs 4 --maxlen 128]
-Outputs: results/mid_layer_laziness.json (every dim & dir), results/figures/mid_layer_laziness.png
+  python mid_layer_laziness.py [--model Qwen/Qwen3-0.6B] [--layer -1] [--reps residual,gate_proj,up_proj,...]
+Outputs: results/mid_layer_laziness.json (every dim & dir, per representation), results/figures/mid_layer_laziness.png
 """
 import os, sys, json, argparse, numpy as np, torch, torch.nn.functional as F
 import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
@@ -18,6 +18,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE); import data as D  # noqa
 dev = "cuda"; RES = os.path.join(HERE, "results"); FIG = os.path.join(RES, "figures")
+SUBMODS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
 
 @torch.no_grad()
@@ -25,79 +26,91 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen3-0.6B"); ap.add_argument("--layer", type=int, default=-1)
     ap.add_argument("--k_freq", type=int, default=100); ap.add_argument("--n_docs", type=int, default=4)
-    ap.add_argument("--maxlen", type=int, default=128); a = ap.parse_args(); os.makedirs(FIG, exist_ok=True)
+    ap.add_argument("--maxlen", type=int, default=96)
+    ap.add_argument("--reps", default="residual," + ",".join(SUBMODS))
+    a = ap.parse_args(); os.makedirs(FIG, exist_ok=True); reps = a.reps.split(",")
     tok = AutoTokenizer.from_pretrained(a.model)
     model = AutoModelForCausalLM.from_pretrained(a.model, torch_dtype=torch.float32).to(dev).eval()
     layers = model.model.layers; NL = len(layers); L = NL // 2 if a.layer < 0 else a.layer
-    Wu = model.get_output_embeddings().weight.detach().float(); Vocab, Dh = Wu.shape
+    Wu = model.get_output_embeddings().weight.detach().float(); Vocab = Wu.shape[0]
     counts, seqs = D.c4_token_stats(tok, Vocab, n_docs=max(a.n_docs, 8), max_len=a.maxlen, device=dev)
     freq_ids = torch.tensor(np.argsort(-counts)[:a.k_freq].copy(), device=dev)
     ids = torch.stack([s[:a.maxlen] for s in seqs])[: a.n_docs]
     fset = torch.zeros(Vocab, dtype=torch.bool, device=dev); fset[freq_ids[freq_ids < Vocab]] = True
-    y = ids[:, 1:]
+    y = ids[:, 1:]; lay = layers[L]
 
     def ce3(logits):
         logp = F.log_softmax(logits[:, :-1].float(), -1)
         ce = -logp.gather(-1, y.unsqueeze(-1)).squeeze(-1).reshape(-1); yf = fset[y.reshape(-1)]
         return float(ce.mean()), float(ce[yf].mean()), float(ce[~yf].mean())
 
-    # ---- characterize the mid-layer residual ----
-    hL = model(ids, output_hidden_states=True).hidden_states[L].float()      # (B,T,D)
-    rms = hL.reshape(-1, Dh).pow(2).mean(0).sqrt(); c_out = int(rms.argmax())
-    mag_ratio = float((rms[c_out] / rms.median()).item())
-    U, S, Vh = torch.linalg.svd(Wu, full_matrices=False)                     # Vh (D,D) right-sing vecs (W_u readout)
-    cos_c = Vh[:, c_out].abs(); i_align = int(cos_c.argmax()); align = float(cos_c.max())
-    print(f"{a.model}  layer {L}/{NL}  D={Dh}", flush=True)
-    print(f"  outlier feature dim = {c_out}, magnitude = {mag_ratio:.0f}x median channel", flush=True)
-    print(f"  aligns with W_u singular dir #{i_align}/{Dh} (sigma-rank {100*i_align/(Dh-1):.0f}% : "
-          f"{'BOTTOM/null' if i_align > 0.9*Dh else 'top' if i_align < 0.1*Dh else 'mid'}), cosine {align:.2f}", flush=True)
+    def getmod(name):
+        return getattr(lay.self_attn, name, None) or getattr(lay.mlp, name, None)
 
-    # ---- causal ablation: hook the mid layer output, run rest of model, measure CE ----
-    def run_ablated(fn):
-        def hook(mod, inp, out):
-            h0 = out[0] if isinstance(out, tuple) else out
-            return ((fn(h0.clone()),) + tuple(out[1:])) if isinstance(out, tuple) else fn(h0.clone())
-        H = layers[L].register_forward_hook(hook); logits = model(ids).logits; H.remove(); return ce3(logits)
+    def capture(name):  # one clean forward, grab the representation that this 'rep' refers to
+        store = {}
+        if name == "residual":
+            h = lay.register_forward_hook(lambda m, i, o: store.__setitem__("x", (o[0] if isinstance(o, tuple) else o).detach().float()))
+        else:
+            h = getmod(name).register_forward_pre_hook(lambda m, i: store.__setitem__("x", i[0].detach().float()))
+        model(ids); h.remove(); return store["x"]
 
-    base = ce3(model(ids).logits); print(f"  base meanCE={base[0]:.3f} freqCE={base[1]:.3f} rareCE={base[2]:.3f}", flush=True)
-    # every FEATURE DIMENSION
-    dim_dmean = np.zeros(Dh); dim_dfreq = np.zeros(Dh); dim_drare = np.zeros(Dh)
-    for c in range(Dh):
-        m, f, r = run_ablated(lambda h, c=c: h.index_fill_(-1, torch.tensor([c], device=dev), 0.0))
-        dim_dmean[c] = m - base[0]; dim_dfreq[c] = f - base[1]; dim_drare[c] = r - base[2]
-        if c % 256 == 0: print(f"    dim {c}/{Dh} ...", flush=True)
-    # every SINGULAR DIRECTION (of W_u, projected out of the mid residual)
-    sv_dmean = np.zeros(Dh); sv_dfreq = np.zeros(Dh); sv_drare = np.zeros(Dh)
-    for i in range(Dh):
-        v = Vh[i]
-        m, f, r = run_ablated(lambda h, v=v: h - (h @ v).unsqueeze(-1) * v)
-        sv_dmean[i] = m - base[0]; sv_dfreq[i] = f - base[1]; sv_drare[i] = r - base[2]
-        if i % 256 == 0: print(f"    sv {i}/{Dh} ...", flush=True)
+    def ablate(name, fn):  # install fn on the right tensor, run rest of model, measure CE
+        if name == "residual":
+            def hk(m, i, o):
+                h0 = o[0] if isinstance(o, tuple) else o
+                return ((fn(h0.clone()),) + tuple(o[1:])) if isinstance(o, tuple) else fn(h0.clone())
+            H = lay.register_forward_hook(hk)
+        else:
+            H = getmod(name).register_forward_pre_hook(lambda m, i: (fn(i[0].clone()),) + tuple(i[1:]))
+        out = model(ids).logits; H.remove(); return ce3(out)
 
-    out = dict(model=a.model, layer=L, D=Dh, outlier_dim=c_out, mag_ratio=mag_ratio,
-               outlier_aligned_sv=i_align, outlier_align_cos=align, sigma_rank_pct=100*i_align/(Dh-1),
-               base=dict(mean=base[0], freq=base[1], rare=base[2]),
-               dim_dmean=dim_dmean.tolist(), dim_dfreq=dim_dfreq.tolist(), dim_drare=dim_drare.tolist(),
-               sv_dmean=sv_dmean.tolist(), sv_dfreq=sv_dfreq.tolist(), sv_drare=sv_drare.tolist())
-    json.dump(out, open(os.path.join(RES, "mid_layer_laziness.json"), "w"))
-    # summary
-    avg_dim = float(np.median(np.abs(dim_dmean))); out_dim = float(abs(dim_dmean[c_out]))
-    print(f"\n  ablate OUTLIER dim {c_out}: ΔmeanCE={dim_dmean[c_out]:+.3f} ΔfreqCE={dim_dfreq[c_out]:+.3f} ΔrareCE={dim_drare[c_out]:+.3f}", flush=True)
-    print(f"  median |ΔmeanCE| over all dims = {avg_dim:.4f}  -> outlier is {out_dim/max(avg_dim,1e-6):.0f}x the typical dim's impact", flush=True)
-    # figure
-    fig, ax = plt.subplots(2, 2, figsize=(15, 9)); idx = np.arange(Dh); t = Dh // 3
-    rmsn = rms.cpu().numpy()
-    ax[0,0].plot(rmsn, lw=.6); ax[0,0].plot([c_out], [rmsn[c_out]], "ro"); ax[0,0].set_yscale("log")
-    ax[0,0].set_title(f"feature-dim magnitude (rms) — outlier dim {c_out} = {mag_ratio:.0f}x median"); ax[0,0].set_xlabel("feature dim")
-    ax[0,1].plot(cos_c.cpu().numpy(), color="#8e44ad", lw=.6); ax[0,1].plot([i_align],[align],"ro")
-    ax[0,1].set_title(f"cos(outlier dim, W_u singular dirs) — peaks at #{i_align} (σ-rank {100*i_align/(Dh-1):.0f}%)"); ax[0,1].set_xlabel("singular dir i")
-    ax[1,0].plot(dim_dmean, lw=.6, label="ΔmeanCE"); ax[1,0].plot(dim_dfreq, lw=.6, label="ΔfreqCE"); ax[1,0].plot(dim_drare, lw=.6, label="ΔrareCE")
-    ax[1,0].plot([c_out],[dim_dmean[c_out]],"ro"); ax[1,0].set_title("causal ablation per FEATURE DIM (outlier dominates; avg≈0)"); ax[1,0].set_xlabel("feature dim"); ax[1,0].legend(fontsize=8)
-    ax[1,1].plot(sv_dmean, lw=.6, label="ΔmeanCE"); ax[1,1].plot(sv_dfreq, lw=.6, label="ΔfreqCE"); ax[1,1].plot(sv_drare, lw=.6, label="ΔrareCE")
-    ax[1,1].axvspan(t, 2*t, color="orange", alpha=.12); ax[1,1].set_title("causal ablation per SINGULAR DIR (of W_u)"); ax[1,1].set_xlabel("singular dir i (large→small σ)"); ax[1,1].legend(fontsize=8)
-    plt.suptitle(f"Mid-layer laziness — layer {L} of {a.model} (C4)", fontweight="bold")
+    base = ce3(model(ids).logits)
+    print(f"{a.model}  layer {L}/{NL}  base meanCE={base[0]:.3f} freqCE={base[1]:.3f} rareCE={base[2]:.3f}\n", flush=True)
+    results = {"model": a.model, "layer": L, "base": dict(mean=base[0], freq=base[1], rare=base[2]), "reps": {}}
+    for name in reps:
+        rep = capture(name); Dh = rep.shape[-1]
+        W = Wu if name == "residual" else getmod(name).weight.detach().float()
+        Vh = torch.linalg.svd(W, full_matrices=False).Vh                       # right-singular vecs (input space)
+        rms = rep.reshape(-1, Dh).pow(2).mean(0).sqrt(); c = int(rms.argmax()); mag = float((rms[c] / rms.median()).item())
+        i_align = int(Vh[:, c].abs().argmax()); cos = float(Vh[:, c].abs().max()); k = Vh.shape[0]
+        dim_m = np.zeros(Dh); dim_f = np.zeros(Dh); dim_r = np.zeros(Dh)
+        for j in range(Dh):
+            m, f, r = ablate(name, lambda h, j=j: h.index_fill_(-1, torch.tensor([j], device=dev), 0.0))
+            dim_m[j], dim_f[j], dim_r[j] = m - base[0], f - base[1], r - base[2]
+        sv_m = np.zeros(k); sv_f = np.zeros(k); sv_r = np.zeros(k)
+        for i in range(k):
+            v = Vh[i]; m, f, r = ablate(name, lambda h, v=v: h - (h @ v).unsqueeze(-1) * v)
+            sv_m[i], sv_f[i], sv_r[i] = m - base[0], f - base[1], r - base[2]
+        t = k // 3
+        bands = {b: float(np.abs(sv_m[s]).mean()) for b, s in [("top", slice(0, t)), ("mid", slice(t, 2 * t)), ("bot", slice(2 * t, k))]}
+        results["reps"][name] = dict(D=Dh, outlier_dim=c, mag_ratio=mag, aligned_sv=i_align, sv_rank_pct=100 * i_align / max(k - 1, 1),
+                                     align_cos=cos, sv_band_pain=bands, outlier_dim_dmean=float(dim_m[c]),
+                                     median_dim_dmean=float(np.median(np.abs(dim_m))),
+                                     dim_dmean=dim_m.tolist(), dim_dfreq=dim_f.tolist(), dim_drare=dim_r.tolist(),
+                                     sv_dmean=sv_m.tolist(), sv_dfreq=sv_f.tolist(), sv_drare=sv_r.tolist())
+        print(f"  {name:10s} D={Dh:4d} outlier dim {c:4d} ({mag:5.0f}x), aligns sv#{i_align} (rank {100*i_align/max(k-1,1):3.0f}%, cos {cos:.2f}) | "
+              f"outlier ΔmeanCE={dim_m[c]:+.3f} vs median dim {np.median(np.abs(dim_m)):.4f} ({abs(dim_m[c])/max(np.median(np.abs(dim_m)),1e-6):.0f}x) | "
+              f"sv-pain top/mid/bot={bands['top']:.3f}/{bands['mid']:.3f}/{bands['bot']:.3f}", flush=True)
+        json.dump(results, open(os.path.join(RES, "mid_layer_laziness.json"), "w"))
+
+    # figure: per-representation summary
+    names = list(results["reps"].keys()); x = np.arange(len(names))
+    fig, ax = plt.subplots(1, 3, figsize=(17, 5))
+    ax[0].bar(x, [results["reps"][n]["mag_ratio"] for n in names], color="#d62728")
+    ax[0].set_yscale("log"); ax[0].set_xticks(x); ax[0].set_xticklabels([n.split('_')[0] for n in names], rotation=45, ha="right")
+    ax[0].set_title("outlier dim magnitude (×median)"); ax[0].axhline(100, color="k", ls=":", lw=.7)
+    for n, c in [("top", "#1f77b4"), ("mid", "#2ca02c"), ("bot", "#ff7f0e")]:
+        ax[1].plot(x, [results["reps"][nm]["sv_band_pain"][n] for nm in names], "-o", label=n + " σ-band")
+    ax[1].set_xticks(x); ax[1].set_xticklabels([n.split('_')[0] for n in names], rotation=45, ha="right")
+    ax[1].set_title("singular-band causal pain (mid = least)"); ax[1].set_ylabel("mean |ΔmeanCE|"); ax[1].legend(fontsize=8)
+    ax[2].plot(x, [abs(results["reps"][n]["outlier_dim_dmean"]) for n in names], "-o", color="#d62728", label="outlier dim")
+    ax[2].plot(x, [results["reps"][n]["median_dim_dmean"] for n in names], "-o", color="#7f8c8d", label="median dim")
+    ax[2].set_yscale("log"); ax[2].set_xticks(x); ax[2].set_xticklabels([n.split('_')[0] for n in names], rotation=45, ha="right")
+    ax[2].set_title("causal pain: outlier dim vs median dim"); ax[2].legend(fontsize=8)
+    plt.suptitle(f"Mid-layer laziness — layer {L} of {a.model}, per representation (C4)", fontweight="bold")
     plt.tight_layout(); plt.savefig(os.path.join(FIG, "mid_layer_laziness.png"), dpi=120, bbox_inches="tight")
-    print("saved results/mid_layer_laziness.{json,png}", flush=True)
+    print("\nsaved results/mid_layer_laziness.{json,png} (full per-dim & per-singular arrays per representation)", flush=True)
 
 
 if __name__ == "__main__":
